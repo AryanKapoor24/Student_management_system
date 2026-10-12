@@ -1,0 +1,23 @@
+[project]
+name = "sms-backend"
+version = "1.0.0"
+description = "Student Management System API"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: import sorting, B: bugbear, UP: pyupgrade
+select = ["E", "W", "F", "I", "B", "UP"]
+# FastAPI's Depends()/Query() in default arguments is the intended pattern
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+filterwarnings = [
+    # Starlette suggests the new httpx2 package; plain httpx still works fine.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
