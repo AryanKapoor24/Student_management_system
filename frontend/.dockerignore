@@ -1,0 +1,7 @@
+# node_modules is reinstalled inside the image with `npm ci`.
+node_modules/
+dist/
+.env
+.env.*
+Dockerfile
+.dockerignore
