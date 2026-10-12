@@ -1,0 +1,243 @@
+# CI/CD pipeline for the Student Management System.
+#
+#   Pull request to main:  lint + test                       (CI only)
+#   Push to main:          lint + test -> build-and-push -> deploy  (CI + CD)
+#
+#   lint ─┐
+#         ├─> build-and-push (backend, frontend) ─> deploy (health check / rollback)
+#   test ─┘
+#
+# Required secrets are documented in docs/CI_CD_SETUP.md.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # allows a manual "Run workflow" button in the Actions tab
+
+# One run per branch at a time. New pushes cancel older PR runs,
+# but a running deployment on main is never cancelled halfway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default; jobs that need more ask for it.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "24"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (ruff + ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python (with pip cache)
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dev dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check backend
+
+      - name: Ruff format check
+        run: ruff format --check backend
+
+      - name: Set up Node.js (with npm cache)
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: ESLint
+        working-directory: frontend
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python (with pip cache)
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Tests use in-memory SQLite (see tests/conftest.py), so no database
+      # service is needed. The pipeline fails if coverage drops below 80%.
+      - name: Run pytest with coverage
+        run: >-
+          pytest
+          --cov=app
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-report=html
+          --cov-fail-under=80
+
+      - name: Add coverage summary to the run page
+        if: always()
+        run: |
+          echo "## Backend test coverage" >> "$GITHUB_STEP_SUMMARY"
+          coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload coverage report artifact
+        if: always() # upload even when tests fail, to help debugging
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: |
+            backend/coverage.xml
+            backend/htmlcov/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build & push ${{ matrix.service }} image
+    needs: [lint, test] # only runs if BOTH lint and test passed
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # needed to push to ghcr.io
+    strategy:
+      matrix:
+        service: [backend, frontend] # two parallel jobs, one per image
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      # Registry names must be lowercase; GitHub usernames may not be.
+      - name: Compute image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sms-${{ matrix.service }}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # automatic, no setup needed
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Reuse Docker layers from previous runs (GitHub Actions cache).
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production # shows deployments on the repo's main page
+    permissions:
+      contents: read
+      packages: read # lets the server pull the images with GITHUB_TOKEN
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+    steps:
+      - name: Check deploy secrets are configured
+        run: |
+          missing=0
+          for name in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is not set (see docs/CI_CD_SETUP.md)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Compute image names
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "BACKEND_IMAGE=ghcr.io/$OWNER/sms-backend" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=ghcr.io/$OWNER/sms-frontend" >> "$GITHUB_ENV"
+
+      # Write the private key and an SSH config entry called "server",
+      # so later steps can simply run `ssh server ...`.
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            User $SSH_USER
+            Port $SSH_PORT
+            IdentityFile ~/.ssh/deploy_key
+            ServerAliveInterval 30
+          EOF
+
+      - name: Copy docker-compose.yml and deploy script to the server
+        run: |
+          ssh server 'mkdir -p ~/sms'
+          scp docker-compose.yml scripts/deploy.sh server:~/sms/
+
+      # The token is sent through stdin, so it never appears in logs or
+      # in the server's process list. It expires when this job ends.
+      - name: Log the server in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | ssh server "docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+
+      - name: Deploy, health check, roll back on failure
+        run: |
+          # shellcheck disable=SC2029 # values are meant to expand here, on the runner
+          ssh server "BACKEND_IMAGE=$BACKEND_IMAGE FRONTEND_IMAGE=$FRONTEND_IMAGE bash ~/sms/deploy.sh ${{ github.sha }}"
+
+      - name: Log the server out of ghcr.io
+        if: always()
+        run: ssh server 'docker logout ghcr.io' || true
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
