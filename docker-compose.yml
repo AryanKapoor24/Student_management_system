@@ -1,0 +1,54 @@
+# Whole stack: PostgreSQL + FastAPI backend + nginx/React frontend.
+#
+#   cp .env.example .env      # then set a real POSTGRES_PASSWORD
+#   docker compose up --build # app at http://localhost
+#
+# Startup order is enforced with healthchecks:
+#   db healthy  ->  backend starts  ->  backend healthy  ->  frontend starts
+#
+# Locally the images are built from source. On the deploy server the CI/CD
+# pipeline sets BACKEND_IMAGE / FRONTEND_IMAGE / IMAGE_TAG to pull the
+# exact images it pushed to ghcr.io instead.
+name: sms
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sms_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sms_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data # data survives container restarts
+    healthcheck:
+      # $$ escapes $ so the variable is read inside the container
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # No "ports:" - the database is reachable only from other containers.
+
+  backend:
+    image: ${BACKEND_IMAGE:-sms-backend}:${IMAGE_TAG:-latest}
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-sms_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sms_db}
+    depends_on:
+      db:
+        condition: service_healthy # wait until PostgreSQL accepts connections
+    restart: unless-stopped
+    # Healthcheck (GET /health) is defined in backend/Dockerfile.
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-sms-frontend}:${IMAGE_TAG:-latest}
+    build: ./frontend
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy # nginx needs the backend to proxy /api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
