@@ -36,7 +36,7 @@ jobs:
   # ---------------------------------------------------------------------------
   lint:
     name: Lint (ruff + ESLint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out code
         uses: actions/checkout@v7
@@ -75,7 +75,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: Test (pytest + coverage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: backend
@@ -126,7 +126,7 @@ jobs:
     needs: [lint, test] # only runs if BOTH lint and test passed
     # Push to main, or the manual "Run workflow" button on main. Never for PRs.
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write # needed to push to ghcr.io
@@ -170,7 +170,7 @@ jobs:
   deploy:
     name: Deploy to server
     needs: build-and-push
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production # shows deployments on the repo's main page
     permissions:
       contents: read
@@ -206,8 +206,14 @@ jobs:
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          # tr removes Windows line endings (\r) that break key parsing
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          # Fail early with a clear message if the secret is not a valid key
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null; then
+            echo "::error::SSH_PRIVATE_KEY is not a valid private key. Paste the whole .pem file, including the BEGIN and END lines."
+            exit 1
+          fi
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<EOF
           Host server
