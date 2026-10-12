@@ -1,7 +1,7 @@
 # CI/CD pipeline for the Student Management System.
 #
 #   Pull request to main:  lint + test                       (CI only)
-#   Push to main:          lint + test -> build-and-push -> deploy  (CI + CD)
+#   Push to main (or manual run):  lint + test -> build-and-push -> deploy  (CI + CD)
 #
 #   lint ─┐
 #         ├─> build-and-push (backend, frontend) ─> deploy (health check / rollback)
@@ -124,7 +124,8 @@ jobs:
   build-and-push:
     name: Build & push ${{ matrix.service }} image
     needs: [lint, test] # only runs if BOTH lint and test passed
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Push to main, or the manual "Run workflow" button on main. Never for PRs.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
