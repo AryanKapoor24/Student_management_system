@@ -1,0 +1,2 @@
+# Store and check out text files with LF endings so scripts work inside Linux containers.
+* text=auto eol=lf
